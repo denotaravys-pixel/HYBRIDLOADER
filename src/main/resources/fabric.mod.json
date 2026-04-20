@@ -1,1 +1,22 @@
-
+{
+  "schemaVersion": 1,
+  "id": "maliopt",
+  "version": "${version}",
+  "name": "MaliOpt",
+  "description": "Mali GPU Optimization Layer for Pojav Launcher",
+  "authors": ["Denotas"],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.maliopt.MaliOptMod"
+    ]
+  },
+  "mixins": [
+    "maliopt.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "1.21.1",
+    "fabric-api": "*"
+  }
+}
