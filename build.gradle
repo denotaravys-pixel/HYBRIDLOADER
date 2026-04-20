@@ -1,1 +1,56 @@
+plugins {
+    id 'fabric-loom' version '1.7-SNAPSHOT'
+    id 'maven-publish'
+}
 
+version = project.mod_version
+group   = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    // Adiciona repositórios aqui se necessário (ex: Modrinth Maven para Sodium/Iris)
+    maven {
+        name = 'Modrinth'
+        url  = 'https://api.modrinth.com/maven'
+    }
+}
+
+dependencies {
+    minecraft    "com.mojang:minecraft:${project.minecraft_version}"
+    mappings     "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Sodium como compileOnly — não inclui no jar, só para compilar os mixins
+    // modCompileOnly "maven.modrinth:sodium:mc1.21.1-0.6.0-fabric"
+
+    // Iris como compileOnly
+    // modCompileOnly "maven.modrinth:iris:1.8.0+mc1.21.1"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+    it.options.encoding = 'UTF-8'
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
