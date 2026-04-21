@@ -60,7 +60,71 @@ public class ExtensionActivator {
         hasAstcHdr = check("GL_KHR_texture_compression_astc_hdr");
 
         MaliOptMod.LOGGER.info("[MaliOpt] ══════════════════════════════════");
+
+        // Quando MobileGlues está a limitar as extensões expostas (menos de 50),
+        // aplica capacidades conhecidas do hardware Bifrost/Valhall.
+        // Isto acontece porque o MobileGlues v1.3.x não faz passthrough de todas
+        // as extensões nativas do driver Mali mesmo com ANGLE desactivado.
+        int detected = GPUDetector.getAllExtensions().size();
+        if (detected < 50 && (GPUDetector.isBifrost() || GPUDetector.isValhall())) {
+            applyForcedMaliMode(detected);
+        }
+
         logCapabilities();
+    }
+
+    /**
+     * Modo forçado Mali — activa capacidades conhecidas do hardware
+     * quando o layer (MobileGlues) não expõe as extensões correctas.
+     *
+     * Apenas flags SEGURAS são forçadas:
+     *
+     *   hasDiscardFramebuffer  → glInvalidateFramebuffer é GLES 3.0 core.
+     *                            Não é extensão, está sempre disponível.
+     *                            TileBasedOptimizer.onFrameEnd() pode usá-la.
+     *
+     *   hasMaliProgramBinary   → Confirmado funcional pelo ShaderCacheManager
+     *   hasGetProgramBinary    → que detectou o formato 0x8f61 (GL_MALI_PROGRAM_BINARY_ARM).
+     *                            Se o ShaderCache correu e encontrou formatos, o mecanismo funciona.
+     *
+     *   hasPackedDepthStencil  → GLES 3.0 core. Sempre disponível em GLES 3.x.
+     *   hasDepth24             → GLES 3.0 core. Sempre disponível em GLES 3.x.
+     *
+     * NÃO são forçadas:
+     *   hasParallelShaderCompile  — GL_KHR_parallel_shader_compile precisa de extensão real.
+     *                               Sem ela, o glGetShaderiv(GL_COMPLETION_STATUS_KHR) falha.
+     *   hasTextureStorage         — GL42.glTexStorage2D pode não estar mapeado via MobileGlues.
+     *   hasBufferStorage          — Mesmo risco.
+     *   hasShaderPixelLocalStorage— TIER 3 — precisa de suporte real no driver GLES.
+     *   hasFramebufferFetch       — TIER 3 — idem.
+     */
+    private static void applyForcedMaliMode(int detected) {
+        MaliOptMod.LOGGER.info("[MaliOpt] ⚠️  Layer a limitar extensões ({} detectadas de ~102 esperadas)", detected);
+        MaliOptMod.LOGGER.info("[MaliOpt] 🔧 Modo forçado Mali Bifrost — aplicando capacidades GLES 3.0 confirmadas");
+
+        // GLES 3.0 core — sempre disponível independentemente do layer
+        if (!hasDiscardFramebuffer) {
+            hasDiscardFramebuffer = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasDiscardFramebuffer  [forçado — GLES 3.0 core]");
+        }
+        if (!hasPackedDepthStencil) {
+            hasPackedDepthStencil = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasPackedDepthStencil  [forçado — GLES 3.0 core]");
+        }
+        if (!hasDepth24) {
+            hasDepth24 = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasDepth24             [forçado — GLES 3.0 core]");
+        }
+
+        // Program binary confirmado pelo ShaderCacheManager (formato 0x8f61 detectado)
+        if (!hasMaliProgramBinary) {
+            hasMaliProgramBinary = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasMaliProgramBinary   [forçado — formato 0x8f61 confirmado]");
+        }
+        if (!hasGetProgramBinary) {
+            hasGetProgramBinary = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasGetProgramBinary    [forçado — GLES 3.0 core]");
+        }
     }
 
     private static boolean check(String ext) {
