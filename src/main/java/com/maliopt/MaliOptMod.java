@@ -4,11 +4,15 @@ import com.maliopt.config.MaliOptConfig;
 import com.maliopt.gpu.ExtensionActivator;
 import com.maliopt.gpu.GPUDetector;
 import com.maliopt.gpu.MobileGluesDetector;
+import com.maliopt.mixin.GameOptionsAccessor;
 import com.maliopt.pipeline.MaliPipelineOptimizer;
 import com.maliopt.pipeline.ShaderCacheManager;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.SimpleOption;
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL20;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,24 +21,18 @@ public class MaliOptMod implements ClientModInitializer {
     public static final String MOD_ID = "maliopt";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    // Distância máxima permitida para render e simulação.
-    // Acima deste valor o Mali-G52 MC2 fica sobrecarregado.
+    // Mínimo MC 1.21.1: simulationDistance >= 5
     private static final int MAX_RENDER_DISTANCE     = 3;
-    private static final int MAX_SIMULATION_DISTANCE = 3;
+    private static final int MAX_SIMULATION_DISTANCE = 5;
 
     @Override
     public void onInitializeClient() {
         LOGGER.info("[MaliOpt] Registando eventos...");
-
-        // Config carrega sem GL — seguro aqui
         MaliOptConfig.load();
 
-        // GL context SÓ existe após CLIENT_STARTED
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
 
             // ── PASSO 1: Detectar renderer ────────────────────────────
-            // MobileGluesDetector DEVE ser o primeiro a correr.
-            // Precisa de contexto GL mas não depende de nenhuma outra classe.
             MobileGluesDetector.detect();
 
             // ── PASSO 2: Info base da GPU ──────────────────────────────
@@ -54,17 +52,14 @@ public class MaliOptMod implements ClientModInitializer {
             if (GPUDetector.isMaliGPU()) {
                 LOGGER.info("[MaliOpt] ✅ GPU Mali detectada — activando optimizações");
 
-                // Com MobileGlues, getAllExtensions() já retorna as 102
-                // extensões GLES reais — ExtensionActivator vai ver tudo ✅
                 ExtensionActivator.activateAll();
                 MaliPipelineOptimizer.init();
                 ShaderCacheManager.init();
 
-                // ── PASSO 4: Forçar distâncias seguras ────────────────
-                // O Mali-G52 MC2 tem 1916 MB device-local partilhados com
-                // o sistema. Render e simulation distance acima de 3 causam
-                // "Can't keep up" no server thread integrado por sobrecarga
-                // de geração de chunks e lighting calculation.
+                // ── PASSO 4: Teste de suporte PLS ─────────────────────
+                testPLSSupport();
+
+                // ── PASSO 5: Forçar distâncias seguras ────────────────
                 forceDistances(client);
 
             } else {
@@ -74,63 +69,78 @@ public class MaliOptMod implements ClientModInitializer {
     }
 
     /**
-     * Força render distance e simulation distance para MAX_RENDER_DISTANCE
-     * e MAX_SIMULATION_DISTANCE se os valores actuais forem superiores.
-     *
-     * Só reduz — nunca aumenta. Se o utilizador tiver já valores menores,
-     * esses são respeitados.
-     *
-     * Escreve as opções no disco para persistir entre sessões.
+     * Testa se o compilador GLSL do MobileGlues aceita
+     * GL_EXT_shader_pixel_local_storage antes de usar em produção.
+     * Temporário — remover após confirmação no log.
      */
-    @SuppressWarnings("unchecked")
-private static void forceDistances(MinecraftClient client) {
-    if (client == null || client.options == null) return;
+    private static void testPLSSupport() {
+        String fragSrc =
+            "#version 310 es\n" +
+            "#extension GL_EXT_shader_pixel_local_storage : require\n" +
+            "precision mediump float;\n" +
+            "__pixel_localEXT FragData {\n" +
+            "    layout(rgba8) lowp vec4 albedo;\n" +
+            "} pls;\n" +
+            "void main() {\n" +
+            "    pls.albedo = vec4(1.0, 0.0, 0.0, 1.0);\n" +
+            "}\n";
 
-    try {
-        boolean changed = false;
+        int shader = GL20.glCreateShader(GL20.GL_FRAGMENT_SHADER);
+        GL20.glShaderSource(shader, fragSrc);
+        GL20.glCompileShader(shader);
 
-        // viewDistance — campo privado em GameOptions desde MC 1.20+
-        java.lang.reflect.Field vdField =
-            net.minecraft.client.option.GameOptions.class.getDeclaredField("viewDistance");
-        vdField.setAccessible(true);
-        net.minecraft.client.option.SimpleOption<Integer> viewDist =
-            (net.minecraft.client.option.SimpleOption<Integer>) vdField.get(client.options);
+        int status = GL20.glGetShaderi(shader, GL20.GL_COMPILE_STATUS);
+        String log  = GL20.glGetShaderInfoLog(shader);
+        GL20.glDeleteShader(shader);
 
-        int currentRender = viewDist.getValue();
-        if (currentRender > MAX_RENDER_DISTANCE) {
-            viewDist.setValue(MAX_RENDER_DISTANCE);
-            LOGGER.info("[MaliOpt] Render distance: {} → {} ✅", currentRender, MAX_RENDER_DISTANCE);
-            changed = true;
+        if (status == GL11.GL_TRUE) {
+            LOGGER.info("[MaliOpt] ✅ PLS COMPILOU — extensão aceite pelo driver");
         } else {
-            LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)", currentRender);
+            LOGGER.warn("[MaliOpt] ❌ PLS FALHOU — log: {}", log);
         }
-
-        // simulationDistance — idem
-        java.lang.reflect.Field sdField =
-            net.minecraft.client.option.GameOptions.class.getDeclaredField("simulationDistance");
-        sdField.setAccessible(true);
-        net.minecraft.client.option.SimpleOption<Integer> simDist =
-            (net.minecraft.client.option.SimpleOption<Integer>) sdField.get(client.options);
-
-        int currentSim = simDist.getValue();
-        if (currentSim > MAX_SIMULATION_DISTANCE) {
-            simDist.setValue(MAX_SIMULATION_DISTANCE);
-            LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅", currentSim, MAX_SIMULATION_DISTANCE);
-            changed = true;
-        } else {
-            LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)", currentSim);
-        }
-
-        if (changed) {
-            client.options.write();
-            LOGGER.info("[MaliOpt] Distâncias guardadas em options.txt ✅");
-        }
-
-    } catch (NoSuchFieldException | IllegalAccessException e) {
-        LOGGER.warn("[MaliOpt] forceDistances falhou via reflexão: {}", e.getMessage());
     }
-}
-    /** Converte 1340 → "1.3.4" */
+
+    /**
+     * Força render/simulation distance para os limites seguros do Mali-G52 MC2.
+     * Usa @Accessor mixin — funciona em produção (sem remap de strings).
+     */
+    private static void forceDistances(MinecraftClient client) {
+        if (client == null || client.options == null) return;
+        try {
+            boolean changed = false;
+            GameOptionsAccessor acc = (GameOptionsAccessor)(Object) client.options;
+
+            SimpleOption<Integer> viewDist = acc.maliopt_getViewDistance();
+            int currentRender = viewDist.getValue();
+            if (currentRender > MAX_RENDER_DISTANCE) {
+                viewDist.setValue(MAX_RENDER_DISTANCE);
+                LOGGER.info("[MaliOpt] Render distance: {} → {} ✅", currentRender, MAX_RENDER_DISTANCE);
+                changed = true;
+            } else {
+                LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)", currentRender);
+            }
+
+            SimpleOption<Integer> simDist = acc.maliopt_getSimulationDistance();
+            int currentSim = simDist.getValue();
+            if (currentSim > MAX_SIMULATION_DISTANCE) {
+                simDist.setValue(MAX_SIMULATION_DISTANCE);
+                LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅", currentSim, MAX_SIMULATION_DISTANCE);
+                changed = true;
+            } else {
+                LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)", currentSim);
+            }
+
+            if (changed) {
+                client.options.write();
+                LOGGER.info("[MaliOpt] Distâncias guardadas em options.txt ✅");
+            }
+
+        } catch (Exception e) {
+            LOGGER.warn("[MaliOpt] forceDistances falhou: {}", e.getMessage());
+        }
+    }
+
+    /** Converte 1304 → "1.3.4" */
     private static String formatMGVersion(int v) {
         if (v <= 0) return "desconhecida";
         int major = v / 1000;
