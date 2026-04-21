@@ -82,40 +82,54 @@ public class MaliOptMod implements ClientModInitializer {
      *
      * Escreve as opções no disco para persistir entre sessões.
      */
-    private static void forceDistances(MinecraftClient client) {
-        if (client == null || client.options == null) return;
+    @SuppressWarnings("unchecked")
+private static void forceDistances(MinecraftClient client) {
+    if (client == null || client.options == null) return;
 
-        try {
-            boolean changed = false;
+    try {
+        boolean changed = false;
 
-            int currentRender = client.options.viewDistance.getValue();
-            if (currentRender > MAX_RENDER_DISTANCE) {
-                client.options.viewDistance.setValue(MAX_RENDER_DISTANCE);
-                LOGGER.info("[MaliOpt] Render distance: {} → {} ✅", currentRender, MAX_RENDER_DISTANCE);
-                changed = true;
-            } else {
-                LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)", currentRender);
-            }
+        // viewDistance — campo privado em GameOptions desde MC 1.20+
+        java.lang.reflect.Field vdField =
+            net.minecraft.client.option.GameOptions.class.getDeclaredField("viewDistance");
+        vdField.setAccessible(true);
+        net.minecraft.client.option.SimpleOption<Integer> viewDist =
+            (net.minecraft.client.option.SimpleOption<Integer>) vdField.get(client.options);
 
-            int currentSim = client.options.simulationDistance.getValue();
-            if (currentSim > MAX_SIMULATION_DISTANCE) {
-                client.options.simulationDistance.setValue(MAX_SIMULATION_DISTANCE);
-                LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅", currentSim, MAX_SIMULATION_DISTANCE);
-                changed = true;
-            } else {
-                LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)", currentSim);
-            }
-
-            if (changed) {
-                client.options.write();
-                LOGGER.info("[MaliOpt] Distâncias guardadas em options.txt ✅");
-            }
-
-        } catch (Exception e) {
-            LOGGER.warn("[MaliOpt] forceDistances falhou: {}", e.getMessage());
+        int currentRender = viewDist.getValue();
+        if (currentRender > MAX_RENDER_DISTANCE) {
+            viewDist.setValue(MAX_RENDER_DISTANCE);
+            LOGGER.info("[MaliOpt] Render distance: {} → {} ✅", currentRender, MAX_RENDER_DISTANCE);
+            changed = true;
+        } else {
+            LOGGER.info("[MaliOpt] Render distance: {} (já dentro do limite)", currentRender);
         }
-    }
 
+        // simulationDistance — idem
+        java.lang.reflect.Field sdField =
+            net.minecraft.client.option.GameOptions.class.getDeclaredField("simulationDistance");
+        sdField.setAccessible(true);
+        net.minecraft.client.option.SimpleOption<Integer> simDist =
+            (net.minecraft.client.option.SimpleOption<Integer>) sdField.get(client.options);
+
+        int currentSim = simDist.getValue();
+        if (currentSim > MAX_SIMULATION_DISTANCE) {
+            simDist.setValue(MAX_SIMULATION_DISTANCE);
+            LOGGER.info("[MaliOpt] Simulation distance: {} → {} ✅", currentSim, MAX_SIMULATION_DISTANCE);
+            changed = true;
+        } else {
+            LOGGER.info("[MaliOpt] Simulation distance: {} (já dentro do limite)", currentSim);
+        }
+
+        if (changed) {
+            client.options.write();
+            LOGGER.info("[MaliOpt] Distâncias guardadas em options.txt ✅");
+        }
+
+    } catch (NoSuchFieldException | IllegalAccessException e) {
+        LOGGER.warn("[MaliOpt] forceDistances falhou via reflexão: {}", e.getMessage());
+    }
+}
     /** Converte 1340 → "1.3.4" */
     private static String formatMGVersion(int v) {
         if (v <= 0) return "desconhecida";
