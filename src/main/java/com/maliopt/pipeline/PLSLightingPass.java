@@ -2,7 +2,7 @@ package com.maliopt.pipeline;
 
 import com.maliopt.MaliOptMod;
 import com.maliopt.shader.ShaderExecutionLayer;
-import com.maliopt.shader.PerformanceGuard;
+import com.maliopt.performance.PerformanceGuard;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.*;
