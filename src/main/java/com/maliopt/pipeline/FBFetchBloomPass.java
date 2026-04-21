@@ -454,3 +454,15 @@ public class FBFetchBloomPass {
     }
 
     // ════════════════════════════════════════════
+ 
+    public static void cleanup() {
+        if (progExtract   != 0) { GL20.glDeleteProgram(progExtract);   progExtract   = 0; }
+        if (progBlur      != 0) { GL20.glDeleteProgram(progBlur);      progBlur      = 0; }
+        if (progComposite != 0) { GL20.glDeleteProgram(progComposite); progComposite = 0; }
+        if (quadVao       != 0) { GL30.glDeleteVertexArrays(quadVao);  quadVao       = 0; }
+        deleteFBOs();
+        ready = false;
+    }
+
+    public static boolean isReady() { return ready; }
+}
