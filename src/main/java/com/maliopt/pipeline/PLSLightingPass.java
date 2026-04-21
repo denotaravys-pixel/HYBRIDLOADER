@@ -5,6 +5,27 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.*;
 
+/**
+ * PLSLightingPass — Fase 3a
+ *
+ * Aplica warmth e AO à cena renderizada.
+ *
+ * ── CORRECÇÕES v1.1 ──────────────────────────────────────────────────
+ *
+ * Bug corrigido: faltava glBindTexture(0) depois do draw.
+ *   O texture binding ficava activo quando o FBFetchBloomPass corria,
+ *   o que causava que o blit final do PLSLightingPass usasse dados
+ *   incorrectos em alguns drivers Mali.
+ *
+ * Bug corrigido: gamma estava aplicado aqui E reinhard no FBFetchBloomPass.
+ *   Double-tonemapping = imagem escura sem contraste.
+ *   CORRECÇÃO: gamma REMOVIDO deste pass. O FBFetchBloomPass é o único
+ *   tonemapper do pipeline (reinhard no final, depois do bloom).
+ *
+ * ── PIPELINE CORRECTO ────────────────────────────────────────────────
+ *   1. PLSLightingPass  → warmth + AO (sem tonemapping)
+ *   2. FBFetchBloomPass → bloom + reinhard (único tonemapper)
+ */
 public class PLSLightingPass {
     private static int program = 0;
     private static int quadVao = 0;
@@ -23,29 +44,30 @@ public class PLSLightingPass {
         "    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);\n" +
         "}\n";
 
-    // POST-PROCESS NORMAL: lê uScene (textura) e escreve em fragColor.
-    // PLS não é adequado aqui porque este pass lê de DRAM (texture sample),
-    // o que já quebra o benefício de tile memory. PLS fica reservado para
-    // Fase 3b onde o acesso é intra-tile (gl_LastFragColorARM).
+    // ✅ FIX: gamma REMOVIDO — o FBFetchBloomPass aplica reinhard no final.
+    // Ter gamma aqui + reinhard no bloom = double-tonemapping = imagem escura.
+    // Este pass só faz warmth (color grading) e AO simulado.
     private static final String FRAG =
         "#version 310 es\n" +
         "precision mediump float;\n" +
         "uniform sampler2D uScene;\n" +
         "uniform float uWarmth;\n" +
         "uniform float uAO;\n" +
-        "uniform float uGamma;\n" +
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
         "void main() {\n" +
         "    vec4 scene = texture(uScene, vUv);\n" +
         "    float lum = dot(scene.rgb, vec3(0.299, 0.587, 0.114));\n" +
+        // Warmth: boost ligeiro nos reds/greens, reduz blues nas zonas claras
         "    vec3 warm = scene.rgb * vec3(\n" +
         "        1.0 + uWarmth * lum,\n" +
         "        1.0 + uWarmth * 0.45 * lum,\n" +
         "        1.0 - uWarmth * 0.25 * lum\n" +
         "    );\n" +
+        // AO simulado: escurece zonas escuras proporcionalmente
         "    float ao = mix(1.0 - uAO, 1.0, lum);\n" +
-        "    vec3 result = pow(clamp(warm * ao, 0.0, 1.0), vec3(1.0 / uGamma));\n" +
+        // ✅ SEM pow/gamma aqui — resultado linear para o bloom processar
+        "    vec3 result = clamp(warm * ao, 0.0, 1.0);\n" +
         "    fragColor = vec4(result, scene.a);\n" +
         "}\n";
 
@@ -71,10 +93,9 @@ public class PLSLightingPass {
             }
 
             GL20.glUseProgram(program);
-            GL20.glUniform1i(GL20.glGetUniformLocation(program, "uScene"), 0);
+            GL20.glUniform1i(GL20.glGetUniformLocation(program, "uScene"),   0);
             GL20.glUniform1f(GL20.glGetUniformLocation(program, "uWarmth"), 0.18f);
-            GL20.glUniform1f(GL20.glGetUniformLocation(program, "uAO"), 0.12f);
-            GL20.glUniform1f(GL20.glGetUniformLocation(program, "uGamma"), 1.08f);
+            GL20.glUniform1f(GL20.glGetUniformLocation(program, "uAO"),     0.12f);
             GL20.glUseProgram(0);
 
             quadVao = GL30.glGenVertexArrays();
@@ -102,6 +123,7 @@ public class PLSLightingPass {
         GL11.glDisable(GL11.GL_DEPTH_TEST);
         GL11.glDisable(GL11.GL_BLEND);
 
+        // Rende warmth+AO em outputFbo, usando fb como textura de input
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, outputFbo);
         GL11.glViewport(0, 0, w, h);
         GL20.glUseProgram(program);
@@ -111,11 +133,18 @@ public class PLSLightingPass {
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
 
+        // ✅ FIX: unbind da textura ANTES do blit
+        // Sem isto, o texture binding activo pode interferir com o blit
+        // e com o FBFetchBloomPass que corre a seguir.
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
+
+        // Blit resultado → framebuffer principal do Minecraft
         GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, outputFbo);
         GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, fb.fbo);
         GL30.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
             GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
 
+        // Restaura estado
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, prevFbo);
         GL20.glUseProgram(prevProgram);
         if (depth) GL11.glEnable(GL11.GL_DEPTH_TEST);
@@ -154,10 +183,10 @@ public class PLSLightingPass {
     }
 
     public static void cleanup() {
-        if (program  != 0) { GL20.glDeleteProgram(program);          program  = 0; }
-        if (quadVao  != 0) { GL30.glDeleteVertexArrays(quadVao);     quadVao  = 0; }
-        if (outputFbo != 0){ GL30.glDeleteFramebuffers(outputFbo);   outputFbo = 0; }
-        if (outputTex != 0){ GL11.glDeleteTextures(outputTex);       outputTex = 0; }
+        if (program   != 0) { GL20.glDeleteProgram(program);         program   = 0; }
+        if (quadVao   != 0) { GL30.glDeleteVertexArrays(quadVao);    quadVao   = 0; }
+        if (outputFbo != 0) { GL30.glDeleteFramebuffers(outputFbo);  outputFbo = 0; }
+        if (outputTex != 0) { GL11.glDeleteTextures(outputTex);      outputTex = 0; }
         ready = false;
     }
 
@@ -175,4 +204,4 @@ public class PLSLightingPass {
         }
         return id;
     }
-}
+            }
