@@ -63,8 +63,8 @@ public final class ShaderCapabilities {
         if (initialised) return;
 
         // Extensões de framebuffer (vindas do ExtensionActivator)
-        PLS            = ExtensionActivator.hasPixelLocalStorage;
-        FB_FETCH       = ExtensionActivator.hasFramebufferFetch;
+        PLS = ExtensionActivator.hasShaderPixelLocalStorage;
+        FB_FETCH = ExtensionActivator.hasFramebufferFetch;
         FB_FETCH_DEPTH = ExtensionActivator.hasFramebufferFetchDepth;
 
         // Extensões de textura (detectar directamente)
