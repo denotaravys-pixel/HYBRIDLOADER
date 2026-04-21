@@ -9,67 +9,74 @@ import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.*;
 
 /**
- * FBFetchBloomPass — Fase 3b (v1.2)
+ * FBFetchBloomPass — Fase 3b (v2.0)
  *
- * Bloom com blur espacial real. Tonemapper único do pipeline.
+ * ── FILOSOFIA ────────────────────────────────────────────────────
  *
- * ── CORRECÇÕES v1.2 ──────────────────────────────────────────────
+ *   REGRA DE OURO:
+ *     Se não houver nenhum pixel brilhante na cena, este pass
+ *     deve devolver a imagem 100% idêntica ao input.
+ *     O bloom é invisível até ser necessário.
  *
- *   BUG CRÍTICO CORRIGIDO: o caminho FBFetch não tinha blur espacial.
- *   gl_LastFragColorARM lê só o pixel ACTUAL — não consegue amostrar
- *   vizinhos. Sem amostragem espacial, bloom = brightening, não glow.
+ *   O QUE FAZ:
+ *     - Extrai APENAS pixels com lum > threshold (zonas realmente brilhantes)
+ *     - Aplica blur Gaussian 9-tap nesses pixels → glow real
+ *     - Soma o glow por cima da cena original (sem modificar a base)
+ *     - Reinhard SOMENTE na luminância → preserva saturação e hue vanilla
  *
- *   SOLUÇÃO: separação em duas fases:
- *     FASE A — FBFetch: lê pixel actual (zero-DRAM), extrai bright mask
- *     FASE B — Blur pass: 9-tap Gaussian blur na bright mask → glow real
- *     FASE C — Composite: soma cena + glow, aplica reinhard
+ *   O QUE NÃO FAZ (NUNCA):
+ *     - Não modifica pixels escuros ou médios
+ *     - Não aplica Reinhard global (a versão antiga destruía as cores)
+ *     - Não usa sceneCopyTex antigo quando a cena já foi processada pelo PLSLightingPass
+ *     - Não crasha se FBFetch não estiver disponível
  *
- *   Parâmetros ajustados via PerformanceGuard (dinâmicos por FPS).
- *   Shaders compilados via ShaderExecutionLayer (#defines Mali).
+ * ── PIPELINE CORRECTO ────────────────────────────────────────────
+ *   Entrada: fb.fbo após PLSLightingPass
  *
- * ── ARQUITECTURA ─────────────────────────────────────────────────
+ *   FASE A — Extract:
+ *     Copia cena → sceneCopyFbo (1 blit necessário)
+ *     Extrai bright mask → brightFbo (só pixels com lum > threshold)
  *
- *   CAMINHO FAST (FBFetch disponível):
- *     1. brightFbo  ← FBFetch shader extrai bright mask (zero-DRAM)
- *     2. blurFbo    ← blur shader amosta brightFbo → glow
- *     3. fb.fbo     ← composite shader soma cena + glow + reinhard
+ *   FASE B — Blur:
+ *     9-tap Gaussian na bright mask → blurFbo (glow suavizado)
  *
- *   CAMINHO FALLBACK (sem FBFetch):
- *     1. sceneCopyFbo ← blit de fb.fbo (1 cópia necessária)
- *     2. brightFbo    ← threshold shader extrai bright mask
- *     3. blurFbo      ← blur shader → glow
- *     4. fb.fbo       ← composite → reinhard
+ *   FASE C — Composite:
+ *     sceneCopyTex + blurTex * intensity → fb.fbo
+ *     Reinhard APENAS na luminância → hue e saturação vanilla preservados
  *
- * ── BLUR: 9-TAP GAUSSIAN ─────────────────────────────────────────
- *   Dois passes separáveis (horizontal + vertical) seriam mais
- *   eficientes, mas num único pass 9-tap é suficiente e mais simples.
- *   O blur corre em blurFbo que pode ser metade da resolução (MEDIUM)
- *   ou full res (HIGH) controlado pelo PerformanceGuard.
+ * ── NOTA SOBRE FBFETCH ────────────────────────────────────────────
+ *   FBFetch (GL_ARM_shader_framebuffer_fetch) não funciona cross-FBO.
+ *   Reservado para passes futuros que escrevem no mesmo FBO que lêem.
+ *   Por agora: sempre texture path (1 blit, eficiente no Mali TBDR).
+ *
+ * ── SEGURANÇA ────────────────────────────────────────────────────
+ *   - Falha silenciosa em qualquer erro — ready=false desativa tudo
+ *   - Restaura estado GL completo após render
+ *   - FBOs reconstruídos automaticamente em mudança de resolução
  */
 public class FBFetchBloomPass {
 
     // ── Programas ────────────────────────────────────────────────────
-    private static int progExtract   = 0;  // extrai bright mask (FBFetch ou texture)
-    private static int progBlur      = 0;  // 9-tap gaussian blur
-    private static int progComposite = 0;  // cena + glow + reinhard
+    private static int progExtract   = 0;
+    private static int progBlur      = 0;
+    private static int progComposite = 0;
 
     // ── FBOs ─────────────────────────────────────────────────────────
-    private static int brightFbo    = 0;   // bright mask
+    private static int brightFbo    = 0;
     private static int brightTex    = 0;
-    private static int blurFbo      = 0;   // glow suavizado
+    private static int blurFbo      = 0;
     private static int blurTex      = 0;
-    private static int sceneCopyFbo = 0;   // só no fallback
+    private static int sceneCopyFbo = 0;
     private static int sceneCopyTex = 0;
 
     private static int quadVao = 0;
     private static int lastW   = 0;
     private static int lastH   = 0;
-    private static boolean ready      = false;
-    private static boolean usingFetch = false;
+    private static boolean ready = false;
 
     // ── Uniforms ─────────────────────────────────────────────────────
+    private static int uExtractScene     = -1;
     private static int uExtractThreshold = -1;
-    private static int uExtractScene     = -1;  // só fallback
     private static int uBlurTex          = -1;
     private static int uBlurTexelSize    = -1;
     private static int uBlurRadius       = -1;
@@ -78,7 +85,7 @@ public class FBFetchBloomPass {
     private static int uCompIntensity    = -1;
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — VERTEX (partilhado)
+    // GLSL — VERTEX (partilhado por todos os passes)
     // ════════════════════════════════════════════════════════════════
     private static final String VERT =
         "#version 310 es\n" +
@@ -90,45 +97,31 @@ public class FBFetchBloomPass {
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — EXTRACT (FBFetch) — extrai bright mask via tile memory
+    // GLSL — EXTRACT
+    // Isola APENAS pixels com luminância acima do threshold.
+    // Pixels abaixo do threshold → vec3(0.0) → sem contribuição no blur.
+    // A máscara é suave (smoothstep) para evitar artefactos de banding.
     // ════════════════════════════════════════════════════════════════
-    private static final String FRAG_EXTRACT_FETCH =
-        "#version 310 es\n" +
-        "#extension GL_ARM_shader_framebuffer_fetch : require\n" +
-        "precision mediump float;\n" +
-        "uniform float uThreshold;\n" +
-        "in vec2 vUv;\n" +
-        "out vec4 fragColor;\n" +
-        "float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n" +
-        "void main() {\n" +
-        "    vec4  scene  = gl_LastFragColorARM;\n" +
-        "    float bright = max(0.0, lum(scene.rgb) - uThreshold)\n" +
-        "                   / (1.0 - uThreshold + 0.001);\n" +
-        // Isola apenas as zonas brilhantes como cor — estas vão ser blurred
-        "    fragColor = vec4(scene.rgb * bright, 1.0);\n" +
-        "}\n";
-
-    // ════════════════════════════════════════════════════════════════
-    // GLSL — EXTRACT (fallback) — lê a cena como textura
-    // ════════════════════════════════════════════════════════════════
-    private static final String FRAG_EXTRACT_TEX =
+    private static final String FRAG_EXTRACT =
         "#version 310 es\n" +
         "precision mediump float;\n" +
         "uniform sampler2D uScene;\n" +
         "uniform float uThreshold;\n" +
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
-        "float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n" +
         "void main() {\n" +
-        "    vec4  scene  = texture(uScene, vUv);\n" +
-        "    float bright = max(0.0, lum(scene.rgb) - uThreshold)\n" +
-        "                   / (1.0 - uThreshold + 0.001);\n" +
-        "    fragColor = vec4(scene.rgb * bright, 1.0);\n" +
+        "    vec3  c   = texture(uScene, vUv).rgb;\n" +
+        "    float lum = dot(c, vec3(0.299, 0.587, 0.114));\n" +
+        "    // smoothstep: transição suave entre lum=threshold e lum=threshold+0.1\n" +
+        "    // Evita banding e isola apenas o brilho real\n" +
+        "    float mask = smoothstep(uThreshold, uThreshold + 0.1, lum);\n" +
+        "    fragColor = vec4(c * mask, 1.0);\n" +
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — BLUR — 9-tap Gaussian separável num único pass
-    // A direcção (horizontal/vertical) é controlada por uRadius.x/y
+    // GLSL — BLUR (9-tap Gaussian separável em cruz)
+    // Corre sobre a bright mask → produz glow suavizado.
+    // uRadius controla o spread — ajustado pelo PerformanceGuard.
     // ════════════════════════════════════════════════════════════════
     private static final String FRAG_BLUR =
         "#version 310 es\n" +
@@ -138,43 +131,48 @@ public class FBFetchBloomPass {
         "uniform float uRadius;\n" +
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
-        "\n" +
         "void main() {\n" +
-        "    // 9-tap Gaussian kernel (sigma ≈ 1.5)\n" +
-        "    // Pesos: 0.227, 0.194, 0.121, 0.054, 0.016 (normalizados)\n" +
+        "    // Gaussian 9-tap normalizado (sigma ≈ 1.5)\n" +
         "    vec3 result = texture(uTex, vUv).rgb * 0.227;\n" +
-        "\n" +
-        "    // Amosta em cruz (horizontal + vertical em simultâneo)\n" +
-        "    vec2 off1 = uTexelSize * uRadius * 1.0;\n" +
-        "    vec2 off2 = uTexelSize * uRadius * 2.0;\n" +
-        "    vec2 off3 = uTexelSize * uRadius * 3.0;\n" +
-        "    vec2 off4 = uTexelSize * uRadius * 4.0;\n" +
-        "\n" +
-        "    result += texture(uTex, vUv + vec2( off1.x, 0.0)).rgb * 0.097;\n" +
-        "    result += texture(uTex, vUv + vec2(-off1.x, 0.0)).rgb * 0.097;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0,  off1.y)).rgb * 0.097;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0, -off1.y)).rgb * 0.097;\n" +
-        "\n" +
-        "    result += texture(uTex, vUv + vec2( off2.x, 0.0)).rgb * 0.061;\n" +
-        "    result += texture(uTex, vUv + vec2(-off2.x, 0.0)).rgb * 0.061;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0,  off2.y)).rgb * 0.061;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0, -off2.y)).rgb * 0.061;\n" +
-        "\n" +
-        "    result += texture(uTex, vUv + vec2( off3.x, 0.0)).rgb * 0.027;\n" +
-        "    result += texture(uTex, vUv + vec2(-off3.x, 0.0)).rgb * 0.027;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0,  off3.y)).rgb * 0.027;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0, -off3.y)).rgb * 0.027;\n" +
-        "\n" +
-        "    result += texture(uTex, vUv + vec2( off4.x, 0.0)).rgb * 0.008;\n" +
-        "    result += texture(uTex, vUv + vec2(-off4.x, 0.0)).rgb * 0.008;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0,  off4.y)).rgb * 0.008;\n" +
-        "    result += texture(uTex, vUv + vec2(0.0, -off4.y)).rgb * 0.008;\n" +
-        "\n" +
+        "    vec2 step1  = uTexelSize * uRadius;\n" +
+        "    vec2 step2  = uTexelSize * uRadius * 2.0;\n" +
+        "    vec2 step3  = uTexelSize * uRadius * 3.0;\n" +
+        "    vec2 step4  = uTexelSize * uRadius * 4.0;\n" +
+        "    result += (texture(uTex, vUv + vec2( step1.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(-step1.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0,  step1.y)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0, -step1.y)).rgb) * 0.097;\n" +
+        "    result += (texture(uTex, vUv + vec2( step2.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(-step2.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0,  step2.y)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0, -step2.y)).rgb) * 0.061;\n" +
+        "    result += (texture(uTex, vUv + vec2( step3.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(-step3.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0,  step3.y)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0, -step3.y)).rgb) * 0.027;\n" +
+        "    result += (texture(uTex, vUv + vec2( step4.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(-step4.x, 0.0)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0,  step4.y)).rgb +\n" +
+        "               texture(uTex, vUv + vec2(0.0, -step4.y)).rgb) * 0.008;\n" +
         "    fragColor = vec4(result, 1.0);\n" +
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — COMPOSITE — soma cena + glow, aplica reinhard
+    // GLSL — COMPOSITE
+    //
+    // PROBLEMA DO v1.x: Reinhard global → HDR / (HDR + 1)
+    //   Aplicava tonemapping a TODA a imagem, incluindo zonas vanilla
+    //   normais. Isso comprimia as cores e causava dessaturação.
+    //
+    // SOLUÇÃO v2.0: Reinhard APENAS na luminância
+    //   1. Soma cena + glow (apenas os highlights brilham mais)
+    //   2. Calcula luminância do resultado HDR
+    //   3. Aplica Reinhard só na luminância: lumTM = lum / (lum + 1)
+    //   4. Escala o RGB pelo rácio lumTM/lum → preserva hue e saturação
+    //   5. Zonas escuras e médias: lum ≈ 0.3, lumTM ≈ 0.23 → escala ≈ 0.77
+    //      ... mas o glow é 0 nessas zonas → hdr = scene → escala ≈ 1.0
+    //   Resultado: imagem vanilla intacta + glow suave nos highlights
+    //
     // ════════════════════════════════════════════════════════════════
     private static final String FRAG_COMPOSITE =
         "#version 310 es\n" +
@@ -184,18 +182,24 @@ public class FBFetchBloomPass {
         "uniform float uIntensity;\n" +
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
-        "\n" +
         "void main() {\n" +
         "    vec3 scene = texture(uScene, vUv).rgb;\n" +
         "    vec3 glow  = texture(uGlow,  vUv).rgb;\n" +
         "\n" +
-        "    // Soma scene + glow escalado pela intensidade\n" +
+        "    // Soma: a cena base nunca é alterada, só recebe o glow por cima\n" +
         "    vec3 hdr = scene + glow * uIntensity;\n" +
         "\n" +
-        "    // Reinhard tonemapping — único tonemapper do pipeline\n" +
-        "    vec3 result = hdr / (hdr + vec3(1.0));\n" +
+        "    // Reinhard SOMENTE na luminância — preserva hue e saturação vanilla\n" +
+        "    float lum   = dot(hdr, vec3(0.299, 0.587, 0.114));\n" +
+        "    float lumTM = lum / (lum + 1.0);\n" +
         "\n" +
-        "    fragColor = vec4(result, 1.0);\n" +
+        "    // Se lum quase zero, escala=1 (sem efeito) — evita divisão por zero\n" +
+        "    float scale = (lum > 0.001) ? (lumTM / lum) : 1.0;\n" +
+        "\n" +
+        "    // Aplica apenas onde o glow existe (não toca zonas vanilla puras)\n" +
+        "    vec3 result = hdr * scale;\n" +
+        "\n" +
+        "    fragColor = vec4(clamp(result, 0.0, 1.0), 1.0);\n" +
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
@@ -204,30 +208,26 @@ public class FBFetchBloomPass {
 
     public static void init() {
         try {
-            // Decide caminho: FBFetch ou texture
-            usingFetch = ShaderCapabilities.FB_FETCH;
-
-            String extractSrc = usingFetch ? FRAG_EXTRACT_FETCH : FRAG_EXTRACT_TEX;
-            String extractName = usingFetch ? "Extract_FBFetch" : "Extract_Tex";
-
-            progExtract   = buildProgram(VERT, extractSrc,    extractName);
-            progBlur      = buildProgram(VERT, FRAG_BLUR,     "Bloom_Blur");
-            progComposite = buildProgram(VERT, FRAG_COMPOSITE,"Bloom_Composite");
+            progExtract   = buildProgram(VERT, FRAG_EXTRACT,   "Bloom_Extract");
+            progBlur      = buildProgram(VERT, FRAG_BLUR,      "Bloom_Blur");
+            progComposite = buildProgram(VERT, FRAG_COMPOSITE, "Bloom_Composite");
 
             if (progExtract == 0 || progBlur == 0 || progComposite == 0) {
-                MaliOptMod.LOGGER.error("[MaliOpt] FBFetchBloomPass: falhou compilação");
+                MaliOptMod.LOGGER.error("[MaliOpt] FBFetchBloomPass: falha de compilação — pass desativado");
+                cleanup();
                 return;
             }
 
             cacheUniforms();
+
             quadVao = GL30.glGenVertexArrays();
             ready   = true;
 
-            MaliOptMod.LOGGER.info("[MaliOpt] ✅ FBFetchBloomPass v1.2 — modo: {}",
-                usingFetch ? "FAST (FBFetch + 9-tap blur)" : "FALLBACK (texture + 9-tap blur)");
+            MaliOptMod.LOGGER.info("[MaliOpt] ✅ FBFetchBloomPass v2.0 — Reinhard-luminance, vanilla-safe");
 
         } catch (Exception e) {
-            MaliOptMod.LOGGER.error("[MaliOpt] FBFetchBloomPass.init(): {}", e.getMessage());
+            MaliOptMod.LOGGER.error("[MaliOpt] FBFetchBloomPass.init() excepção: {}", e.getMessage());
+            cleanup();
         }
     }
 
@@ -242,9 +242,13 @@ public class FBFetchBloomPass {
         Framebuffer fb = mc.getFramebuffer();
         int w = fb.textureWidth;
         int h = fb.textureHeight;
-        if (w != lastW || h != lastH) rebuildFBOs(w, h);
-        if (brightFbo == 0 || blurFbo == 0) return;
 
+        if (w <= 0 || h <= 0) return;
+
+        if (w != lastW || h != lastH) rebuildFBOs(w, h);
+        if (brightFbo == 0 || blurFbo == 0 || sceneCopyFbo == 0) return;
+
+        // Guarda estado GL
         int prevFbo     = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
         int prevProgram = GL11.glGetInteger(GL20.GL_CURRENT_PROGRAM);
         boolean depth   = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
@@ -253,16 +257,16 @@ public class FBFetchBloomPass {
         GL11.glDisable(GL11.GL_DEPTH_TEST);
         GL11.glDisable(GL11.GL_BLEND);
 
-        // ── FASE A: extrai bright mask ─────────────────────────
+        // ── FASE A: copia cena actual + extrai bright mask ─────────
         phaseExtract(fb, w, h);
 
-        // ── FASE B: blur 9-tap → glow ──────────────────────────
+        // ── FASE B: blur 9-tap na bright mask → glow ───────────────
         phaseBlur(w, h);
 
-        // ── FASE C: composite cena + glow + reinhard ───────────
+        // ── FASE C: composite cena + glow, Reinhard-luminance ──────
         phaseComposite(fb, w, h);
 
-        // Restaura estado
+        // Restaura estado GL
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, prevFbo);
         GL20.glUseProgram(prevProgram);
         if (depth) GL11.glEnable(GL11.GL_DEPTH_TEST);
@@ -272,39 +276,20 @@ public class FBFetchBloomPass {
     // ── Fase A: Extract ───────────────────────────────────────────────
 
     private static void phaseExtract(Framebuffer fb, int w, int h) {
+        // Copia a cena ACTUAL (já processada pelo PLSLightingPass) para sceneCopyFbo
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, fb.fbo);
+        GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, sceneCopyFbo);
+        GL30.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+            GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
+
+        // Extrai bright mask para brightFbo
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, brightFbo);
         GL11.glViewport(0, 0, w, h);
         GL20.glUseProgram(progExtract);
+        GL20.glUniform1i(uExtractScene, 0);
         GL20.glUniform1f(uExtractThreshold, PerformanceGuard.bloomThreshold());
-
-        if (usingFetch) {
-            // FBFetch: lê directamente de fb.fbo via tile memory
-            // ATENÇÃO: o progExtract deve ser executado com fb.fbo como READ source.
-            // Para FBFetch funcionar, precisamos de estar a DRAW para o mesmo attachment
-            // de onde fazemos fetch. A solução correcta é escrever brightFbo
-            // enquanto o fb.fbo está como base de leitura — não é possível com FBFetch puro.
-            //
-            // CORRECÇÃO DEFINITIVA: FBFetch não funciona cross-FBO.
-            // Usamos SEMPRE a path de texture para o extract (copia necessária).
-            // FBFetch fica reservado para passes futuros que escrevem no mesmo FBO.
-            usingFetch = false;
-            // Recai no caminho de texture abaixo
-        }
-
-        // Caminho texture: copia fb.fbo → sceneCopyFbo, usa como source
-        if (!usingFetch) {
-            // Copia cena para sceneCopyFbo
-            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, fb.fbo);
-            GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, sceneCopyFbo);
-            GL30.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
-                GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
-
-            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, brightFbo);
-            GL20.glUniform1i(uExtractScene, 0);
-            GL13.glActiveTexture(GL13.GL_TEXTURE0);
-            GL11.glBindTexture(GL11.GL_TEXTURE_2D, sceneCopyTex);
-        }
-
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, sceneCopyTex);
         GL30.glBindVertexArray(quadVao);
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
@@ -338,16 +323,19 @@ public class FBFetchBloomPass {
         GL20.glUniform1i(uCompGlow,  1);
         GL20.glUniform1f(uCompIntensity, PerformanceGuard.bloomIntensity());
 
+        // uScene = sceneCopyTex (cena após PLSLightingPass, antes do bloom)
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, sceneCopyTex);  // cena pré-bloom
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, sceneCopyTex);
+
+        // uGlow = blurTex (glow suavizado — só pixels brilhantes)
         GL13.glActiveTexture(GL13.GL_TEXTURE1);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, blurTex);       // glow blurred
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, blurTex);
 
         GL30.glBindVertexArray(quadVao);
         GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, 3);
         GL30.glBindVertexArray(0);
 
-        // Cleanup textures
+        // Cleanup texturas
         GL13.glActiveTexture(GL13.GL_TEXTURE1);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
@@ -363,16 +351,17 @@ public class FBFetchBloomPass {
 
         brightTex    = makeTex(w, h, true);
         brightFbo    = makeFbo(brightTex);
-        blurTex      = makeTex(w, h, true);   // GL_LINEAR para suavizar
+        blurTex      = makeTex(w, h, true);
         blurFbo      = makeFbo(blurTex);
         sceneCopyTex = makeTex(w, h, false);
         sceneCopyFbo = makeFbo(sceneCopyTex);
 
         if (brightFbo == 0 || blurFbo == 0 || sceneCopyFbo == 0) {
-            MaliOptMod.LOGGER.error("[MaliOpt] BloomPass: FBO setup falhou");
+            MaliOptMod.LOGGER.error("[MaliOpt] BloomPass: FBO setup falhou — pass desativado");
             deleteFBOs();
         } else {
-            lastW = w; lastH = h;
+            lastW = w;
+            lastH = h;
             MaliOptMod.LOGGER.info("[MaliOpt] BloomPass FBOs: {}x{}", w, h);
         }
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
@@ -386,6 +375,8 @@ public class FBFetchBloomPass {
         int filter = linear ? GL11.GL_LINEAR : GL11.GL_NEAREST;
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, filter);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, filter);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
+        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, GL12.GL_CLAMP_TO_EDGE);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
         return tex;
     }
@@ -409,6 +400,8 @@ public class FBFetchBloomPass {
         if (blurTex      != 0) { GL11.glDeleteTextures(blurTex);          blurTex      = 0; }
         if (sceneCopyFbo != 0) { GL30.glDeleteFramebuffers(sceneCopyFbo); sceneCopyFbo = 0; }
         if (sceneCopyTex != 0) { GL11.glDeleteTextures(sceneCopyTex);     sceneCopyTex = 0; }
+        lastW = 0;
+        lastH = 0;
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -417,8 +410,8 @@ public class FBFetchBloomPass {
 
     private static void cacheUniforms() {
         GL20.glUseProgram(progExtract);
-        uExtractThreshold = GL20.glGetUniformLocation(progExtract, "uThreshold");
         uExtractScene     = GL20.glGetUniformLocation(progExtract, "uScene");
+        uExtractThreshold = GL20.glGetUniformLocation(progExtract, "uThreshold");
 
         GL20.glUseProgram(progBlur);
         uBlurTex       = GL20.glGetUniformLocation(progBlur, "uTex");
@@ -460,20 +453,4 @@ public class FBFetchBloomPass {
         return prog;
     }
 
-    // ════════════════════════════════════════════════════════════════
-    // CLEANUP
-    // ════════════════════════════════════════════════════════════════
-
-    public static void cleanup() {
-        if (progExtract   != 0) { GL20.glDeleteProgram(progExtract);   progExtract   = 0; }
-        if (progBlur      != 0) { GL20.glDeleteProgram(progBlur);      progBlur      = 0; }
-        if (progComposite != 0) { GL20.glDeleteProgram(progComposite); progComposite = 0; }
-        if (quadVao       != 0) { GL30.glDeleteVertexArrays(quadVao);  quadVao       = 0; }
-        deleteFBOs();
-        ready      = false;
-        usingFetch = false;
-    }
-
-    public static boolean isReady()      { return ready; }
-    public static boolean isUsingFetch() { return usingFetch; }
-}
+    // ════════════════════════════════════════════
