@@ -42,16 +42,32 @@ public class GPUDetector {
     }
 
     /**
-     * FASE 2 — Fix crítico.
-     * GL4ES com glGetString(GL_EXTENSIONS) retorna extensões desktop → todas ❌.
-     * glGetStringi em loop retorna extensões GLES reais do driver Mali.
+     * FASE 3 — Detecção de extensões com prioridade MobileGlues.
+     *
+     * Ordem de prioridade:
+     * 1. MobileGlues activo + backend_string_getter_access
+     *    → extensões GLES reais do driver Mali (102 extensões)
+     * 2. glGetStringi loop (GL4ES / qualquer outro renderer)
+     *    → extensões desktop emuladas (87 extensões — problema conhecido)
+     * 3. Fallback glGetString
+     *    → último recurso
      */
     public static Set<String> getAllExtensions() {
         if (cachedExtensions != null) return cachedExtensions;
 
-        Set<String> exts = new HashSet<>();
+        // PRIORIDADE 1 — MobileGlues backend access
+        // Retorna as 102 extensões GLES reais do Mali-G52 MC2
+        if (MobileGluesDetector.isActive() && MobileGluesDetector.hasBackendAccess()) {
+            Set<String> backendExts = MobileGluesDetector.getBackendExtensions();
+            if (!backendExts.isEmpty()) {
+                MaliOptMod.LOGGER.info("[MaliOpt] Extensões via MobileGlues backend: {}", backendExts.size());
+                cachedExtensions = backendExts;
+                return cachedExtensions;
+            }
+        }
 
-        // Método moderno — GL 3.0+ / GLES 3.0+ — ng_gl4es suporta
+        // PRIORIDADE 2 — glGetStringi loop (GL4ES / sem MobileGlues)
+        Set<String> exts = new HashSet<>();
         try {
             int count = GL11.glGetInteger(GL30.GL_NUM_EXTENSIONS);
             if (count > 0) {
@@ -65,7 +81,7 @@ public class GPUDetector {
             MaliOptMod.LOGGER.warn("[MaliOpt] glGetStringi falhou: {}", e.getMessage());
         }
 
-        // Fallback — método antigo se glGetStringi falhar
+        // PRIORIDADE 3 — Fallback string plana
         if (exts.isEmpty()) {
             String flat = safeGet(GL11.GL_EXTENSIONS);
             if (!flat.isEmpty()) {
@@ -96,6 +112,13 @@ public class GPUDetector {
         return r.contains("G52") || r.contains("G57")
             || r.contains("G68") || r.contains("G76")
             || r.contains("G77");
+    }
+
+    public static boolean isValhall() {
+        String r = getRenderer();
+        return r.contains("G310") || r.contains("G510")
+            || r.contains("G610") || r.contains("G710")
+            || r.contains("G715");
     }
 
     public static void resetCache() {
