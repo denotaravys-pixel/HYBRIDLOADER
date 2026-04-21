@@ -76,33 +76,37 @@ public class ExtensionActivator {
      * quando o layer (MobileGlues) não expõe as extensões correctas.
      *
      * ── TIER 1 — GLES 3.0 core / confirmado por ShaderCache ────────
-     *   hasDiscardFramebuffer  glInvalidateFramebuffer é GLES 3.0 core.
-     *                          TileBasedOptimizer.onFrameEnd() usa-a para
-     *                          poupar 2-4 MB/frame de bandwidth de depth.
-     *
-     *   hasMaliProgramBinary   Confirmado pelo ShaderCacheManager que
-     *   hasGetProgramBinary    detectou o formato 0x8f61 no arranque.
-     *
-     *   hasPackedDepthStencil  GLES 3.0 core — sempre disponível.
-     *   hasDepth24             GLES 3.0 core — sempre disponível.
+     *   hasDiscardFramebuffer  glInvalidateFramebuffer GLES 3.0 core.
+     *                          TileBasedOptimizer.onFrameEnd() poupa
+     *                          2-4 MB/frame de bandwidth de depth.
+     *   hasMaliProgramBinary   Formato 0x8f61 confirmado pelo ShaderCache.
+     *   hasGetProgramBinary    GLES 3.0 core.
+     *   hasPackedDepthStencil  GLES 3.0 core.
+     *   hasDepth24             GLES 3.0 core.
      *
      * ── TIER 2 — GLES 3.0/3.2 core ─────────────────────────────────
-     *   hasTextureStorage      glTexStorage2D é GLES 3.0 core.
-     *                          MaliPipelineOptimizer.optimizeBoundTexture()
-     *                          usa GL42.glTexStorage2D que o LWJGL mapeia
-     *                          para a mesma função em GLES 3.x.
-     *                          Cria texturas imutáveis — o driver elimina
-     *                          a verificação de estado em cada draw call.
+     *   hasTextureStorage      glTexStorage2D GLES 3.0 core.
+     *                          MaliPipelineOptimizer usa GL42.glTexStorage2D.
+     *                          Texturas imutáveis — driver elimina re-validação
+     *                          de estado em cada draw call.
+     *   hasBufferStorage       glBufferStorage GLES 3.2 core.
+     *                          Sem chamadas GL directas no código actual —
+     *                          usado para TIER e preparação Fase 3.
      *
-     *   hasBufferStorage       glBufferStorage promovido para GLES 3.2 core.
-     *                          MobileGlues corre sobre GLES 3.2 — garantido.
-     *                          Sem chamadas GL directas no código actual:
-     *                          usado apenas para TIER e preparação Fase 3.
+     * ── TIER 3 — Capability declarada (implementação Fase 3) ────────
+     *   hasShaderPixelLocalStorage  O hardware Mali-G52 MC2 suporta PLS
+     *   hasFramebufferFetch         nativamente (confirmado no perfil do
+     *   hasFramebufferFetchDepth    dispositivo com 102 extensões).
+     *
+     *                          IMPORTANTE: no código actual não há chamadas
+     *                          GL nem shaders que usem PLS ou Framebuffer
+     *                          Fetch — estas flags declaram a capacidade do
+     *                          hardware para a Fase 3 (shaders TBDR custom).
+     *                          Forçar aqui é seguro porque nenhum código
+     *                          activo as usa para fazer chamadas GL.
      *
      * ── NÃO forçamos ────────────────────────────────────────────────
      *   hasParallelShaderCompile  só funciona com extensão real no driver.
-     *   hasShaderPixelLocalStorage  TIER 3 — precisa de driver real.
-     *   hasFramebufferFetch         TIER 3 — precisa de driver real.
      */
     private static void applyForcedMaliMode(int detected) {
         MaliOptMod.LOGGER.info("[MaliOpt] ⚠️  Layer a limitar extensões ({} detectadas de ~102 esperadas)", detected);
@@ -111,33 +115,47 @@ public class ExtensionActivator {
         // ── TIER 1 ───────────────────────────────────────────────────
         if (!hasDiscardFramebuffer) {
             hasDiscardFramebuffer = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasDiscardFramebuffer  [forçado — GLES 3.0 core]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasDiscardFramebuffer       [forçado — GLES 3.0 core]");
         }
         if (!hasPackedDepthStencil) {
             hasPackedDepthStencil = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasPackedDepthStencil  [forçado — GLES 3.0 core]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasPackedDepthStencil       [forçado — GLES 3.0 core]");
         }
         if (!hasDepth24) {
             hasDepth24 = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasDepth24             [forçado — GLES 3.0 core]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasDepth24                  [forçado — GLES 3.0 core]");
         }
         if (!hasMaliProgramBinary) {
             hasMaliProgramBinary = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasMaliProgramBinary   [forçado — formato 0x8f61 confirmado]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasMaliProgramBinary        [forçado — formato 0x8f61 confirmado]");
         }
         if (!hasGetProgramBinary) {
             hasGetProgramBinary = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasGetProgramBinary    [forçado — GLES 3.0 core]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasGetProgramBinary         [forçado — GLES 3.0 core]");
         }
 
         // ── TIER 2 ───────────────────────────────────────────────────
         if (!hasTextureStorage) {
             hasTextureStorage = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasTextureStorage      [forçado — glTexStorage2D GLES 3.0 core]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasTextureStorage           [forçado — glTexStorage2D GLES 3.0 core]");
         }
         if (!hasBufferStorage) {
             hasBufferStorage = true;
-            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasBufferStorage       [forçado — glBufferStorage GLES 3.2 core]");
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasBufferStorage            [forçado — glBufferStorage GLES 3.2 core]");
+        }
+
+        // ── TIER 3 — capability declarada, implementação na Fase 3 ──
+        if (!hasShaderPixelLocalStorage) {
+            hasShaderPixelLocalStorage = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasShaderPixelLocalStorage  [forçado — hardware Bifrost confirmado]");
+        }
+        if (!hasFramebufferFetch) {
+            hasFramebufferFetch = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasFramebufferFetch         [forçado — hardware Bifrost confirmado]");
+        }
+        if (!hasFramebufferFetchDepth) {
+            hasFramebufferFetchDepth = true;
+            MaliOptMod.LOGGER.info("[MaliOpt]   ✅ hasFramebufferFetchDepth    [forçado — hardware Bifrost confirmado]");
         }
     }
 
@@ -162,4 +180,4 @@ public class ExtensionActivator {
         if (hasFramebufferFetch)
             MaliOptMod.LOGGER.info("[MaliOpt] ⚡ Framebuffer Fetch DISPONÍVEL (Fase 3/4)");
     }
-}
+    }
