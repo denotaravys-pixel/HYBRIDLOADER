@@ -5,13 +5,18 @@ import com.maliopt.gpu.ExtensionActivator;
 import com.maliopt.gpu.GPUDetector;
 import com.maliopt.gpu.MobileGluesDetector;
 import com.maliopt.mixin.GameOptionsAccessor;
+import com.maliopt.performance.PerformanceGuard;
 import com.maliopt.pipeline.FBFetchBloomPass;
 import com.maliopt.pipeline.MaliPipelineOptimizer;
 import com.maliopt.pipeline.PLSLightingPass;
 import com.maliopt.pipeline.ShaderCacheManager;
+import com.maliopt.shader.ShaderCache;
+import com.maliopt.shader.ShaderCapabilities;
+import com.maliopt.shader.ShaderExecutionLayer;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.SimpleOption;
 import org.slf4j.Logger;
@@ -49,14 +54,28 @@ public class MaliOptMod implements ClientModInitializer {
             if (GPUDetector.isMaliGPU()) {
                 LOGGER.info("[MaliOpt] ✅ GPU Mali detectada — activando optimizações");
 
+                // ── 1. Extensões hardware ────────────────────────────
                 ExtensionActivator.activateAll();
+
+                // ── 2. Capacidades de shader ─────────────────────────
+                ShaderCapabilities.init();
+
+                // ── 3. Camada de execução de shaders ─────────────────
+                ShaderExecutionLayer.init();
+
+                // ── 4. Cache de shaders compilados ───────────────────
+                try {
+                    ShaderCache.init(FabricLoader.getInstance().getGameDir());
+                } catch (Exception e) {
+                    LOGGER.warn("[MaliOpt] ShaderCache.init falhou: {}", e.getMessage());
+                }
+
+                // ── 5. Pipeline de renderização ───────────────────────
                 MaliPipelineOptimizer.init();
                 ShaderCacheManager.init();
 
-                // Fase 3a — Lighting pass
+                // ── 6. Passes de post-processing ─────────────────────
                 PLSLightingPass.init();
-
-                // Fase 3b — Bloom via FBFetch
                 FBFetchBloomPass.init();
 
                 forceDistances(client);
@@ -67,20 +86,19 @@ public class MaliOptMod implements ClientModInitializer {
         });
 
         // ── Post-process pipeline ─────────────────────────────────
-        // Ordem importante: primeiro lighting, depois bloom.
-        // Ambos correm após o mundo estar completamente renderizado.
         WorldRenderEvents.LAST.register(context -> {
             MinecraftClient mc = MinecraftClient.getInstance();
 
+            // 0. Atualiza monitor de performance (uma vez por frame)
+            PerformanceGuard.update(mc);
+
             // 1. PLSLightingPass — warmth, AO, gamma
-            if (PLSLightingPass.isReady()) {
+            if (PLSLightingPass.isReady() && PerformanceGuard.lightingPassEnabled()) {
                 PLSLightingPass.render(mc);
             }
 
-            // 2. FBFetchBloomPass — bloom com ou sem FBFetch
-            //    Se FBFetch disponível: lê da tile memory (ZERO DRAM)
-            //    Se não: texture sample (1 pass, ainda mais rápido que Iris)
-            if (FBFetchBloomPass.isReady()) {
+            // 2. FBFetchBloomPass — bloom adaptativo
+            if (FBFetchBloomPass.isReady() && PerformanceGuard.bloomEnabled()) {
                 FBFetchBloomPass.render(mc);
             }
         });
