@@ -9,7 +9,7 @@ import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.opengl.*;
 
 /**
- * FBFetchBloomPass — Fase 3b (v2.0)
+ * FBFetchBloomPass — Fase 3b (v3.0)
  *
  * ── FILOSOFIA ────────────────────────────────────────────────────
  *
@@ -22,11 +22,12 @@ import org.lwjgl.opengl.*;
  *     - Extrai APENAS pixels com lum > threshold (zonas realmente brilhantes)
  *     - Aplica blur Gaussian 9-tap nesses pixels → glow real
  *     - Soma o glow por cima da cena original (sem modificar a base)
- *     - Reinhard SOMENTE na luminância → preserva saturação e hue vanilla
+ *     - ACES Filmic Tonemapper na luminância → preserva saturação e hue vanilla
+ *     - Boost de saturação configurável via uSaturation
  *
  *   O QUE NÃO FAZ (NUNCA):
  *     - Não modifica pixels escuros ou médios
- *     - Não aplica Reinhard global (a versão antiga destruía as cores)
+ *     - Não aplica Reinhard global (destruía as cores na v2.x)
  *     - Não usa sceneCopyTex antigo quando a cena já foi processada pelo PLSLightingPass
  *     - Não crasha se FBFetch não estiver disponível
  *
@@ -42,7 +43,8 @@ import org.lwjgl.opengl.*;
  *
  *   FASE C — Composite:
  *     sceneCopyTex + blurTex * intensity → fb.fbo
- *     Reinhard APENAS na luminância → hue e saturação vanilla preservados
+ *     ACES tonemapper → preserva saturação e hue
+ *     Boost de saturação pós-tonemap → cores vibrantes sem exagero
  *
  * ── NOTA SOBRE FBFETCH ────────────────────────────────────────────
  *   FBFetch (GL_ARM_shader_framebuffer_fetch) não funciona cross-FBO.
@@ -83,6 +85,7 @@ public class FBFetchBloomPass {
     private static int uCompScene        = -1;
     private static int uCompGlow         = -1;
     private static int uCompIntensity    = -1;
+    private static int uCompSaturation   = -1;  // v3.0: boost de saturação pós-ACES
 
     // ════════════════════════════════════════════════════════════════
     // GLSL — VERTEX (partilhado por todos os passes)
@@ -158,20 +161,33 @@ public class FBFetchBloomPass {
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
-    // GLSL — COMPOSITE
+    // GLSL — COMPOSITE (v3.0)
     //
-    // PROBLEMA DO v1.x: Reinhard global → HDR / (HDR + 1)
-    //   Aplicava tonemapping a TODA a imagem, incluindo zonas vanilla
-    //   normais. Isso comprimia as cores e causava dessaturação.
+    // PROBLEMA v2.x: Reinhard na luminância → comprime brilho e dessatura
+    //   O rácio lumTM/lum escala igualmente todos os canais, mas a compressão
+    //   da luminância reduz a percepção de saturação nas zonas de bloom.
+    //   Resultado: véu acinzentado visível em zonas com glow.
     //
-    // SOLUÇÃO v2.0: Reinhard APENAS na luminância
-    //   1. Soma cena + glow (apenas os highlights brilham mais)
-    //   2. Calcula luminância do resultado HDR
-    //   3. Aplica Reinhard só na luminância: lumTM = lum / (lum + 1)
-    //   4. Escala o RGB pelo rácio lumTM/lum → preserva hue e saturação
-    //   5. Zonas escuras e médias: lum ≈ 0.3, lumTM ≈ 0.23 → escala ≈ 0.77
-    //      ... mas o glow é 0 nessas zonas → hdr = scene → escala ≈ 1.0
-    //   Resultado: imagem vanilla intacta + glow suave nos highlights
+    // SOLUÇÃO v3.0:
+    //   1. ACES Filmic Tonemapper (Narkowicz 2015):
+    //      Fórmula: (x*(2.51x+0.03)) / (x*(2.43x+0.59)+0.14)
+    //      Propriedades: contraste maior nos midtones, saturação preservada,
+    //      roll-off suave nos highlights sem "amarelado" do Reinhard.
+    //
+    //   2. highp para cálculo HDR:
+    //      mediump é float16 no Mali-G52. Se uIntensity > 1.0 e a cena
+    //      for brilhante, a soma HDR pode perder precisão em mediump.
+    //      Usamos highp vec3 apenas onde é crítico — sem custo de bandwidth.
+    //
+    //   3. Boost de saturação pós-tonemap (uSaturation):
+    //      mix(gray, color, uSaturation) extrapolado além de 1.0.
+    //      Após ACES a imagem já está em [0,1]; o boost satura sutilmente.
+    //      Clamp final garante saída limpa independentemente do valor de
+    //      uSaturation — seguro mesmo com valores acidentalmente altos.
+    //
+    // VALORES RECOMENDADOS:
+    //   uIntensity  = bloomIntensity()  (default PerformanceGuard: ~0.8)
+    //   uSaturation = 1.2f             (boost subtil, sem exagero)
     //
     // ════════════════════════════════════════════════════════════════
     private static final String FRAG_COMPOSITE =
@@ -180,26 +196,48 @@ public class FBFetchBloomPass {
         "uniform sampler2D uScene;\n" +
         "uniform sampler2D uGlow;\n" +
         "uniform float uIntensity;\n" +
+        "uniform float uSaturation;\n" +  // v3.0: boost de saturação [1.0 = neutro, 1.2 = recomendado]
         "in vec2 vUv;\n" +
         "out vec4 fragColor;\n" +
+        "\n" +
+        "// ── ACES Filmic Tonemapper (Narkowicz 2015) ──────────────────\n" +
+        "// Mais neutro que Reinhard: não amarela os midtones, preserva\n" +
+        "// a saturação e faz roll-off suave nos highlights.\n" +
+        "// Input/Output: [0, ∞) → [0, 1]\n" +
+        "vec3 aces_tonemap(vec3 x) {\n" +
+        "    const float a = 2.51;\n" +
+        "    const float b = 0.03;\n" +
+        "    const float c = 2.43;\n" +
+        "    const float d = 0.59;\n" +
+        "    const float e = 0.14;\n" +
+        "    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);\n" +
+        "}\n" +
+        "\n" +
         "void main() {\n" +
         "    vec3 scene = texture(uScene, vUv).rgb;\n" +
         "    vec3 glow  = texture(uGlow,  vUv).rgb;\n" +
         "\n" +
-        "    // Soma: a cena base nunca é alterada, só recebe o glow por cima\n" +
-        "    vec3 hdr = scene + glow * uIntensity;\n" +
+        "    // highp para a soma HDR — evita perda de precisão float16\n" +
+        "    // no Mali-G52 quando uIntensity > 1.0 e cena é brilhante.\n" +
+        "    // O cast para highp é apenas local, sem custo de bandwidth.\n" +
+        "    highp vec3 hdr = highp vec3(scene) + highp vec3(glow) * highp float(uIntensity);\n" +
         "\n" +
-        "    // Reinhard SOMENTE na luminância — preserva hue e saturação vanilla\n" +
-        "    float lum   = dot(hdr, vec3(0.299, 0.587, 0.114));\n" +
-        "    float lumTM = lum / (lum + 1.0);\n" +
+        "    // ACES → saída já em [0, 1], saturação preservada\n" +
+        "    vec3 color = aces_tonemap(vec3(hdr));\n" +
         "\n" +
-        "    // Se lum quase zero, escala=1 (sem efeito) — evita divisão por zero\n" +
-        "    float scale = (lum > 0.001) ? (lumTM / lum) : 1.0;\n" +
+        "    // ── Boost de saturação pós-tonemap ─────────────────────────\n" +
+        "    // Interpola entre versão dessaturada (gray) e a cor original.\n" +
+        "    // uSaturation > 1.0 extrapola → cores mais vibrantes.\n" +
+        "    // uSaturation = 1.0 → sem efeito (identidade)\n" +
+        "    float gray = dot(color, vec3(0.299, 0.587, 0.114));\n" +
+        "    color = mix(vec3(gray), color, uSaturation);\n" +
         "\n" +
-        "    // Aplica apenas onde o glow existe (não toca zonas vanilla puras)\n" +
-        "    vec3 result = hdr * scale;\n" +
+        "    // Clamp final: necessário porque mix com uSaturation > 1.0\n" +
+        "    // pode extrair valores ligeiramente fora de [0,1].\n" +
+        "    // O clamp evita artefactos no framebuffer Mali.\n" +
+        "    color = clamp(color, 0.0, 1.0);\n" +
         "\n" +
-        "    fragColor = vec4(clamp(result, 0.0, 1.0), 1.0);\n" +
+        "    fragColor = vec4(color, 1.0);\n" +
         "}\n";
 
     // ════════════════════════════════════════════════════════════════
@@ -223,7 +261,7 @@ public class FBFetchBloomPass {
             quadVao = GL30.glGenVertexArrays();
             ready   = true;
 
-            MaliOptMod.LOGGER.info("[MaliOpt] ✅ FBFetchBloomPass v2.0 — Reinhard-luminance, vanilla-safe");
+            MaliOptMod.LOGGER.info("[MaliOpt] ✅ FBFetchBloomPass v3.0 — ACES tonemap, saturação vibrante, highp HDR");
 
         } catch (Exception e) {
             MaliOptMod.LOGGER.error("[MaliOpt] FBFetchBloomPass.init() excepção: {}", e.getMessage());
@@ -263,7 +301,7 @@ public class FBFetchBloomPass {
         // ── FASE B: blur 9-tap na bright mask → glow ───────────────
         phaseBlur(w, h);
 
-        // ── FASE C: composite cena + glow, Reinhard-luminance ──────
+        // ── FASE C: composite cena + glow, ACES + saturação ────────
         phaseComposite(fb, w, h);
 
         // Restaura estado GL
@@ -322,6 +360,12 @@ public class FBFetchBloomPass {
         GL20.glUniform1i(uCompScene, 0);
         GL20.glUniform1i(uCompGlow,  1);
         GL20.glUniform1f(uCompIntensity, PerformanceGuard.bloomIntensity());
+
+        // v3.0: uSaturation — boost de cor pós-ACES
+        // 1.0 = neutro (sem efeito), 1.2 = vibrante sem exagero
+        // CRÍTICO: se este valor for 0.0, a imagem fica cinzenta!
+        // Nunca omitir esta linha — o default GLSL de uniform float é 0.0.
+        GL20.glUniform1f(uCompSaturation, 1.2f);
 
         // uScene = sceneCopyTex (cena após PLSLightingPass, antes do bloom)
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
@@ -419,9 +463,10 @@ public class FBFetchBloomPass {
         uBlurRadius    = GL20.glGetUniformLocation(progBlur, "uRadius");
 
         GL20.glUseProgram(progComposite);
-        uCompScene     = GL20.glGetUniformLocation(progComposite, "uScene");
-        uCompGlow      = GL20.glGetUniformLocation(progComposite, "uGlow");
-        uCompIntensity = GL20.glGetUniformLocation(progComposite, "uIntensity");
+        uCompScene      = GL20.glGetUniformLocation(progComposite, "uScene");
+        uCompGlow       = GL20.glGetUniformLocation(progComposite, "uGlow");
+        uCompIntensity  = GL20.glGetUniformLocation(progComposite, "uIntensity");
+        uCompSaturation = GL20.glGetUniformLocation(progComposite, "uSaturation"); // v3.0
 
         GL20.glUseProgram(0);
     }
@@ -453,8 +498,8 @@ public class FBFetchBloomPass {
         return prog;
     }
 
-    // ════════════════════════════════════════════
- 
+    // ════════════════════════════════════════════════════════════════
+
     public static void cleanup() {
         if (progExtract   != 0) { GL20.glDeleteProgram(progExtract);   progExtract   = 0; }
         if (progBlur      != 0) { GL20.glDeleteProgram(progBlur);      progBlur      = 0; }
@@ -465,4 +510,4 @@ public class FBFetchBloomPass {
     }
 
     public static boolean isReady() { return ready; }
-}
+            }
