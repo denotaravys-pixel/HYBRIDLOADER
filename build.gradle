@@ -11,10 +11,17 @@ base {
 }
 
 repositories {
-    // Adiciona repositórios aqui se necessário (ex: Modrinth Maven para Sodium/Iris)
     maven {
         name = 'Modrinth'
         url  = 'https://api.modrinth.com/maven'
+    }
+    maven {
+        name = 'Xander Maven'
+        url  = 'https://maven.isxander.dev/releases'
+    }
+    maven {
+        name = 'TerraformersMC'
+        url  = 'https://maven.terraformersmc.com'
     }
 }
 
@@ -24,10 +31,10 @@ dependencies {
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-    // Sodium como compileOnly — não inclui no jar, só para compilar os mixins
-    // modCompileOnly "maven.modrinth:sodium:mc1.21.1-0.6.0-fabric"
+    modImplementation "dev.isxander.yacl:yet-another-config-lib-fabric:3.6.6+1.21.1"
+    modImplementation "com.terraformersmc:modmenu:11.0.3"
 
-    // Iris como compileOnly
+    // modCompileOnly "maven.modrinth:sodium:mc1.21.1-0.6.0-fabric"
     // modCompileOnly "maven.modrinth:iris:1.8.0+mc1.21.1"
 }
 
