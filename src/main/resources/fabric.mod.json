@@ -3,11 +3,14 @@
   "id": "maliopt",
   "version": "${version}",
   "name": "MaliOpt",
-  "description": "Mali GPU Optimization Layer for Pojav Launcher",
+  "description": "Mali GPU Optimization Layer for Pojav/ZalithLauncher",
   "authors": ["Denotas"],
   "environment": "client",
   "entrypoints": {
     "client": [
+      "com.maliopt.MaliOptMod"
+    ],
+    "modmenu": [
       "com.maliopt.MaliOptMod"
     ]
   },
@@ -17,6 +20,11 @@
   "depends": {
     "fabricloader": ">=0.15.0",
     "minecraft": "1.21.1",
-    "fabric-api": "*"
+    "fabric-api": "*",
+    "yet_another_config_lib_v3": "*",
+    "modmenu": "*"
+  },
+  "suggests": {
+    "sodium": "*"
   }
 }
