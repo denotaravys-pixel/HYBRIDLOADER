@@ -36,21 +36,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # ⚠️ PASSO CRÍTICO: Gerar o Gradle Wrapper automaticamente
+      # 🗑️ ELIMINAR O ACCESS WIDENER CORROMPIDO (SOLUÇÃO FINAL)
+      - name: Remover access widener inválido
+        run: rm -f src/main/resources/maliopt.accesswidener
+
       - name: Gerar Gradle Wrapper
         run: |
           gradle wrapper --gradle-version 8.8
           chmod +x ./gradlew
 
-      # 🧹 Limpar cache do Loom para evitar erro de access widener
       - name: Limpar cache do Loom
         run: rm -rf .gradle/loom-cache || true
 
-      # 🔨 Compilar o mod
       - name: Compilar com Gradle
         run: ./gradlew clean build --no-daemon
 
-      # 📦 Publicar artefacto (JAR)
       - name: Upload do artefacto
         uses: actions/upload-artifact@v4
         with:
@@ -58,7 +58,6 @@ jobs:
           path: build/libs/*.jar
           if-no-files-found: error
 
-      # 🚀 Criar Release (apenas para tags)
       - name: Criar Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
